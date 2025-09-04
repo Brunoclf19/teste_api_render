@@ -59,6 +59,19 @@ def get_model():
 # ========= App =========
 app = Flask(__name__)
 
+# ---- Rotas leves para pinger/monitor ----
+@app.get("/")
+def root():
+    return {
+        "status": "running",
+        "hint": "use /health ou POST /rossmann/predict"
+    }, 200
+
+@app.get("/ping")
+def ping():
+    # resposta mínima e rápida para monitores externos
+    return Response("pong", status=200, mimetype="text/plain")
+
 @app.get("/health")
 def health():
     exists = MODEL_PATH.exists()
