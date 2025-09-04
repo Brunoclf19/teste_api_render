@@ -6,19 +6,47 @@ import numpy as np
 import inflection
 import datetime
 import math
+from pathlib import Path
 
 class Rossmann(object):
     def __init__(self):
-        # raiz do projeto
-        self.home_path = r''
+        """
+        Define a raiz do projeto de forma robusta:
+        - este arquivo está em <repo_root>/rossmann/Rossmann.py
+        - então repo_root = Path(__file__).resolve().parents[1]
+        Permite override com a env var PARAM_DIR se precisar.
+        """
+        repo_root = Path(__file__).resolve().parents[1]
+        env_param_dir = os.getenv("PARAM_DIR")
+        if env_param_dir:
+            param_dir = Path(env_param_dir)
+        else:
+            param_dir = repo_root / "parameter"
 
-        # use os.path.join para evitar caminho inválido
-        param_dir = os.path.join(self.home_path, 'parameter')
-        self.competition_distance_scaler    = pickle.load(open(os.path.join(param_dir, 'competition_distance_scaler.pkl'), 'rb'))
-        self.competition_time_month_scaler  = pickle.load(open(os.path.join(param_dir, 'competition_time_month_scaler.pkl'), 'rb'))
-        self.promo_time_week_scaler         = pickle.load(open(os.path.join(param_dir, 'promo_time_week_scaler.pkl'), 'rb'))
-        self.year_scaler                    = pickle.load(open(os.path.join(param_dir, 'year_scaler.pkl'), 'rb'))
-        self.store_type_scaler              = pickle.load(open(os.path.join(param_dir, 'store_type_scaler.pkl'), 'rb'))
+        # guarda paths para debug se precisar
+        self.home_path = repo_root
+        self.param_dir = param_dir
+
+        # Carregamento dos artefatos
+        try:
+            with open(param_dir / 'competition_distance_scaler.pkl', 'rb') as f:
+                self.competition_distance_scaler = pickle.load(f)
+            with open(param_dir / 'competition_time_month_scaler.pkl', 'rb') as f:
+                self.competition_time_month_scaler = pickle.load(f)
+            with open(param_dir / 'promo_time_week_scaler.pkl', 'rb') as f:
+                self.promo_time_week_scaler = pickle.load(f)
+            with open(param_dir / 'year_scaler.pkl', 'rb') as f:
+                self.year_scaler = pickle.load(f)
+            with open(param_dir / 'store_type_scaler.pkl', 'rb') as f:
+                self.store_type_scaler = pickle.load(f)
+        except FileNotFoundError as e:
+            # Mensagem mais clara, mostrando onde procurou
+            raise FileNotFoundError(
+                f"Arquivo de parâmetro não encontrado: {e.filename}\n"
+                f"Tentei ler em: {param_dir}\n"
+                f"Dica: confirme se a pasta 'parameter/' está na raiz do repositório "
+                f"e foi enviada no deploy, ou defina PARAM_DIR apontando para ela."
+            ) from e
 
     def data_cleaning(self, df1):
         # 1) renomear SOMENTE as colunas necessárias (sem mexer na ordem do DF)
@@ -95,7 +123,6 @@ class Rossmann(object):
 
         return df1
 
-
     def feature_engineering(self, df2):
         # defensivo: garantir datetime
         if not pd.api.types.is_datetime64_any_dtype(df2['date']):
@@ -122,7 +149,6 @@ class Rossmann(object):
         comp_days = comp_days.fillna(0).astype(int)
         df2['competition_time_month'] = comp_days // 30
 
-
         # promo since
         df2['promo_since'] = df2.apply(
             lambda x: datetime.datetime(
@@ -145,7 +171,6 @@ class Rossmann(object):
         df2 = df2.drop(['open','promo_interval','month_map'], axis=1, errors='ignore')
 
         return df2
-
 
     def data_preparation(self, df5):
         # escalonamento
@@ -181,7 +206,6 @@ class Rossmann(object):
         ]
         return df5[cols_selected]
 
-
     def get_prediction(self, model, original_data, test_data):
         # Garante que as colunas estejam na MESMA ordem do treino
         expected = model.get_booster().feature_names
@@ -198,4 +222,3 @@ class Rossmann(object):
         original_data = original_data.copy()
         original_data['predictions'] = np.expm1(pred)
         return original_data.to_json(orient='records', date_format='iso')
-
