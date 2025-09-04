@@ -6,3 +6,4 @@ xgboost==3.0.4
 scikit-learn==1.6.1
 seaborn==0.13.2
 uvicorn==0.35.0
+gunicorn>=21.2
