@@ -6,7 +6,7 @@ import pickle
 from pathlib import Path
 from flask import Flask, request, Response
 
-# ========= Descobrir raiz do repo (funciona em /src ou /api) =========
+# ========= Descobrir raiz do repo =========
 def find_repo_root(start: Path) -> Path:
     candidates = [start, start.parent, start.parent.parent]
     for c in candidates:
@@ -14,17 +14,18 @@ def find_repo_root(start: Path) -> Path:
             return c
     return start.parent
 
-CURRENT_DIR = Path(__file__).resolve().parent  # .../src  (ou .../api)
-REPO_ROOT = find_repo_root(CURRENT_DIR)        # .../project
+CURRENT_DIR = Path(__file__).resolve().parent  # .../src
+REPO_ROOT = find_repo_root(CURRENT_DIR)
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 # ========= Import do pipeline =========
 from rossmann.Rossmann import Rossmann  # noqa: E402
 
-# ========= Caminho do modelo e lazy load =========
+# ========= Caminho do modelo =========
 MODEL_PATH = REPO_ROOT / "model" / "model_rossman.pkl"
 _model = None  # cache em memória
+
 
 def _download_model_if_needed(path: Path) -> None:
     """Baixa o modelo de MODEL_URL se não existir localmente."""
@@ -37,15 +38,15 @@ def _download_model_if_needed(path: Path) -> None:
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        import requests  # se não estiver no reqs, fazemos fallback abaixo
+        import requests
         r = requests.get(url, timeout=60)
         r.raise_for_status()
         path.write_bytes(r.content)
     except Exception:
-        # Fallback para stdlib
         import urllib.request
         with urllib.request.urlopen(url, timeout=60) as resp:
             path.write_bytes(resp.read())
+
 
 def get_model():
     """Carrega o modelo apenas na primeira chamada (economiza RAM no boot)."""
@@ -56,22 +57,27 @@ def get_model():
             _model = pickle.load(f)
     return _model
 
+
 # ========= App =========
 app = Flask(__name__)
 
-# ---- Rotas leves para pinger/monitor ----
+
+# rota raiz
 @app.get("/")
 def root():
     return {
         "status": "running",
-        "hint": "use /health ou POST /rossmann/predict"
+        "message": "API Rossmann no ar 🚀"
     }, 200
 
+
+# rota de ping
 @app.get("/ping")
 def ping():
-    # resposta mínima e rápida para monitores externos
-    return Response("pong", status=200, mimetype="text/plain")
+    return {"ping": "pong"}, 200
 
+
+# rota de healthcheck
 @app.get("/health")
 def health():
     exists = MODEL_PATH.exists()
@@ -81,10 +87,11 @@ def health():
         "model_exists": exists
     }, 200
 
+
+# rota principal de predição
 @app.post("/rossmann/predict")
 def rossmann_predict():
     try:
-        # Import pesado só quando precisar
         import pandas as pd
 
         if "application/json" not in (request.headers.get("Content-Type") or ""):
@@ -132,6 +139,7 @@ def rossmann_predict():
             status=500,
             mimetype="application/json",
         )
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
