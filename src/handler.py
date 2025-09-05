@@ -81,10 +81,23 @@ def ping():
 @app.get("/health")
 def health():
     exists = MODEL_PATH.exists()
+    load_ok = False
+    err = None
+    if exists:
+        try:
+            # tenta carregar o modelo para validar compatibilidade de versões
+            with open(MODEL_PATH, "rb") as f:
+                _ = pickle.load(f)
+            load_ok = True
+        except Exception as e:
+            err = str(e)
+
     return {
         "status": "ok",
         "model_path": str(MODEL_PATH),
-        "model_exists": exists
+        "model_exists": exists,
+        "model_load_ok": load_ok,
+        "model_error": err
     }, 200
 
 
