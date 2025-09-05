@@ -157,10 +157,24 @@ def rossmann_predict():
         app.logger.info("predict:after_cleaning rows=%d cols=%d", len(df1), len(df1.columns))
         df2 = pipeline.feature_engineering(df1)
         app.logger.info("predict:after_fe rows=%d cols=%d", len(df2), len(df2.columns))
+        # ...
         df3 = pipeline.data_preparation(df2)
         app.logger.info("predict:after_prep rows=%d cols=%d", len(df3), len(df3.columns))
 
+        # ===== DEBUG: permitir dry-run sem carregar o modelo =====
+        if os.getenv("PREDICT_DRY_RUN", "0") == "1":
+            preview = df3.head(3).to_dict(orient="records")
+            body = {
+                "mode": "dry-run",
+                "prepared_shape": [int(len(df3)), int(len(df3.columns))],
+                "prepared_columns": list(df3.columns),
+                "prepared_preview": preview
+            }
+            return Response(json.dumps(body, ensure_ascii=False), status=200, mimetype="application/json")
+        # ===== FIM DEBUG =====
+
         model = get_model()
+        
         app.logger.info("predict:model_loaded")
 
         df_response = pipeline.get_prediction(model, df_in, df3)
