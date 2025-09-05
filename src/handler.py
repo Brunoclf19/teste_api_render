@@ -1,5 +1,14 @@
 # handler.py
 import os
+
+# ===== 1a) Limitar threads das libs nativas (antes de qualquer import pesado) =====
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+os.environ.setdefault("BLIS_NUM_THREADS", "1")
+
 import sys
 import json
 import pickle
@@ -77,7 +86,7 @@ def ping():
     return {"ping": "pong"}, 200
 
 
-# rota de healthcheck
+# ===== 1b) /health com modo "deep" usando o cache do get_model() =====
 @app.get("/health")
 def health():
     exists = MODEL_PATH.exists()
@@ -104,41 +113,45 @@ def health():
     }, 200
 
 
-
-# rota principal de predição
+# ===== 1c) /rossmann/predict com logs de marcos + JSON tolerante =====
 @app.post("/rossmann/predict")
 def rossmann_predict():
     try:
+        app.logger.info("predict:start")
         import pandas as pd
 
-        if "application/json" not in (request.headers.get("Content-Type") or ""):
-            return Response(
-                json.dumps({"error": "Content-Type deve ser application/json"}),
-                status=400,
-                mimetype="application/json",
-            )
-
-        payload = request.get_json(silent=True)
+        # Tolerar ausência/erro de Content-Type usando force=True
+        payload = request.get_json(silent=True, force=True)
         if payload is None:
+            app.logger.info("predict:payload_none")
             return Response("[]", status=200, mimetype="application/json")
 
         # Normaliza em DataFrame
         if isinstance(payload, dict):
             df_in = pd.DataFrame(payload, index=[0])
         elif isinstance(payload, list) and payload:
-            cols = sorted(set().union(*(d.keys() for d in payload)))
-            df_in = pd.DataFrame(payload, columns=cols)
+            # DataFrame direto da lista de dicts
+            df_in = pd.DataFrame(payload)
         else:
+            app.logger.info("predict:payload_empty_list")
             return Response("[]", status=200, mimetype="application/json")
+
+        app.logger.info("predict:payload_ok rows=%d cols=%d", len(df_in), len(df_in.columns))
 
         # Pipeline
         pipeline = Rossmann()
         df1 = pipeline.data_cleaning(df_in.copy())
+        app.logger.info("predict:after_cleaning rows=%d cols=%d", len(df1), len(df1.columns))
         df2 = pipeline.feature_engineering(df1)
+        app.logger.info("predict:after_fe rows=%d cols=%d", len(df2), len(df2.columns))
         df3 = pipeline.data_preparation(df2)
+        app.logger.info("predict:after_prep rows=%d cols=%d", len(df3), len(df3.columns))
 
         model = get_model()
+        app.logger.info("predict:model_loaded")
+
         df_response = pipeline.get_prediction(model, df_in, df3)
+        app.logger.info("predict:after_predict")
 
         # Se já vier string JSON do pipeline, devolve direto
         if isinstance(df_response, str):
@@ -150,12 +163,12 @@ def rossmann_predict():
 
     except Exception as e:
         import traceback
-        traceback.print_exc()
-        return Response(
-            json.dumps({"error": str(e)}),
-            status=500,
-            mimetype="application/json",
-        )
+        app.logger.exception("predict:error")
+        body = {"error": str(e), "type": e.__class__.__name__}
+        # Opcional: exporte DEBUG_ERRORS=1 no Render para receber traceback no JSON
+        if os.getenv("DEBUG_ERRORS", "0") == "1":
+            body["trace"] = traceback.format_exc()
+        return Response(json.dumps(body, ensure_ascii=False), status=500, mimetype="application/json")
 
 
 if __name__ == "__main__":
