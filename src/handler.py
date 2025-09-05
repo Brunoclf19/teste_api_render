@@ -81,7 +81,6 @@ def ping():
 @app.get("/health")
 def health():
     exists = MODEL_PATH.exists()
-    # modo rápido (default): só checa existência do arquivo
     deep = request.args.get("deep") == "1"
 
     load_ok = None
@@ -89,9 +88,8 @@ def health():
 
     if deep and exists:
         try:
-            # tenta carregar o pickle para validar compatibilidade de versões
-            with open(MODEL_PATH, "rb") as f:
-                _ = pickle.load(f)
+            # usa o cache: só carrega uma vez e reaproveita
+            _ = get_model()
             load_ok = True
         except Exception as e:
             load_ok = False
@@ -101,9 +99,10 @@ def health():
         "status": "ok",
         "model_path": str(MODEL_PATH),
         "model_exists": exists,
-        "model_load_ok": load_ok,   # None = não checou; True/False = checou
+        "model_load_ok": load_ok,  # None = não checou
         "model_error": err
     }, 200
+
 
 
 # rota principal de predição
