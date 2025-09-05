@@ -92,27 +92,32 @@ def health():
     try:
         deep = request.args.get("deep") == "1"
         app.logger.info(f"/health called deep={deep}")
+
         exists = MODEL_PATH.exists()
         load_ok = None
         err = None
-
-        if deep and exists:
-            try:
-                _ = get_model()  # usa cache; se der OOM/erro, veremos no log
-                load_ok = True
-            except Exception as e:
-                load_ok = False
-                err = str(e)
-
         body = {
             "status": "ok",
             "model_path": str(MODEL_PATH),
             "model_exists": exists,
-            "model_load_ok": load_ok,   # None = não checou
-            "model_error": err
+            "model_load_ok": None,
+            "model_error": None
         }
-        from flask import Response
-        import json
+
+        if deep and exists:
+            # Checagem LEVE: sem carregar o modelo na RAM (evita OOM/queda do worker)
+            import hashlib
+            size = MODEL_PATH.stat().st_size
+            h = hashlib.sha256()
+            with open(MODEL_PATH, "rb") as f:
+                for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                    h.update(chunk)
+            body.update({
+                "model_size_bytes": size,
+                "model_sha256": h.hexdigest(),
+                "note": "light check: file present and readable; not loading into memory"
+            })
+
         return Response(json.dumps(body, ensure_ascii=False), 200, mimetype="application/json")
     except Exception as e:
         app.logger.exception("/health error")
