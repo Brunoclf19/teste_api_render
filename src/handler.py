@@ -89,28 +89,36 @@ def ping():
 # ===== 1b) /health com modo "deep" usando o cache do get_model() =====
 @app.get("/health")
 def health():
-    exists = MODEL_PATH.exists()
-    deep = request.args.get("deep") == "1"
+    try:
+        deep = request.args.get("deep") == "1"
+        app.logger.info(f"/health called deep={deep}")
+        exists = MODEL_PATH.exists()
+        load_ok = None
+        err = None
 
-    load_ok = None
-    err = None
+        if deep and exists:
+            try:
+                _ = get_model()  # usa cache; se der OOM/erro, veremos no log
+                load_ok = True
+            except Exception as e:
+                load_ok = False
+                err = str(e)
 
-    if deep and exists:
-        try:
-            # usa o cache: só carrega uma vez e reaproveita
-            _ = get_model()
-            load_ok = True
-        except Exception as e:
-            load_ok = False
-            err = str(e)
+        body = {
+            "status": "ok",
+            "model_path": str(MODEL_PATH),
+            "model_exists": exists,
+            "model_load_ok": load_ok,   # None = não checou
+            "model_error": err
+        }
+        from flask import Response
+        import json
+        return Response(json.dumps(body, ensure_ascii=False), 200, mimetype="application/json")
+    except Exception as e:
+        app.logger.exception("/health error")
+        body = {"status": "error", "message": str(e)}
+        return Response(json.dumps(body, ensure_ascii=False), 500, mimetype="application/json")
 
-    return {
-        "status": "ok",
-        "model_path": str(MODEL_PATH),
-        "model_exists": exists,
-        "model_load_ok": load_ok,  # None = não checou
-        "model_error": err
-    }, 200
 
 
 # ===== 1c) /rossmann/predict com logs de marcos + JSON tolerante =====
