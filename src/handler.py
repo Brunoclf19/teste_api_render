@@ -1,7 +1,7 @@
 # handler.py
 import os
 
-# ===== 1a) Limitar threads das libs nativas (antes de qualquer import pesado) =====
+# ===== 1) Limitar threads das libs nativas (antes de qualquer import pesado) =====
 os.environ.setdefault("OMP_NUM_THREADS", "1")
 os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
 os.environ.setdefault("MKL_NUM_THREADS", "1")
@@ -11,7 +11,7 @@ os.environ.setdefault("BLIS_NUM_THREADS", "1")
 
 import sys
 import json
-import pickle
+import pickle  # mantido apenas para compat; não é usado no load do booster
 from pathlib import Path
 from flask import Flask, request, Response
 
@@ -31,23 +31,23 @@ if str(REPO_ROOT) not in sys.path:
 # ========= Import do pipeline =========
 from rossmann.Rossmann import Rossmann  # noqa: E402
 
-# ========= Caminho do modelo =========
-MODEL_PATH = REPO_ROOT / "model" / "model_rossman.pkl"
+# ========= Caminhos do modelo e features =========
+MODEL_PATH = REPO_ROOT / "model" / "model_rossman.ubj"         # agora em UBJ
+FEATURE_NAMES_PATH = REPO_ROOT / "model" / "feature_names.json" # nomes das colunas
 _model = None  # cache em memória
 
 
-def _download_model_if_needed(path: Path) -> None:
-    """Baixa o modelo de MODEL_URL se não existir localmente."""
+def _download_file_if_needed(path: Path, url_env: str) -> None:
+    """Baixa um arquivo a partir de uma env var (ex.: MODEL_URL ou FEATURE_NAMES_URL) se não existir localmente."""
     if path.exists():
         return
-    url = os.getenv("MODEL_URL")
+    url = os.getenv(url_env)
     if not url:
-        raise FileNotFoundError(
-            f"Modelo não encontrado em: {path} e a variável MODEL_URL não foi definida."
-        )
+        # silencioso: só baixa se a env var existir
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
-        import requests
+        import requests  # type: ignore
         r = requests.get(url, timeout=60)
         r.raise_for_status()
         path.write_bytes(r.content)
@@ -58,12 +58,56 @@ def _download_model_if_needed(path: Path) -> None:
 
 
 def get_model():
-    """Carrega o modelo apenas na primeira chamada (economiza RAM no boot)."""
+    """
+    Carrega o modelo XGBoost (Booster) salvo em UBJ e devolve um wrapper
+    com a mesma interface usada no pipeline (get_booster() e predict()).
+    """
     global _model
-    if _model is None:
-        _download_model_if_needed(MODEL_PATH)
-        with open(MODEL_PATH, "rb") as f:
-            _model = pickle.load(f)
+    if _model is not None:
+        return _model
+
+    # opcional: baixar modelo e feature_names de URLs (se configuradas)
+    _download_file_if_needed(MODEL_PATH, "MODEL_URL")
+    _download_file_if_needed(FEATURE_NAMES_PATH, "FEATURE_NAMES_URL")
+
+    import xgboost as xgb
+
+    if not MODEL_PATH.exists():
+        raise FileNotFoundError(
+            f"Modelo não encontrado em: {MODEL_PATH}\n"
+            f"Dica: confirme se 'model/model_rossman.ubj' foi commitado ou defina MODEL_URL."
+        )
+
+    booster = xgb.Booster()
+    booster.load_model(str(MODEL_PATH))
+
+    # garantir feature_names no booster
+    feat_names = getattr(booster, "feature_names", None)
+    if not feat_names:
+        if FEATURE_NAMES_PATH.exists():
+            try:
+                feat_names = json.loads(FEATURE_NAMES_PATH.read_text(encoding="utf-8"))
+                booster.feature_names = feat_names
+            except Exception as e:
+                # não é crítico, mas ajuda no get_prediction() do pipeline
+                raise RuntimeError(
+                    f"Falha ao ler feature_names em {FEATURE_NAMES_PATH}: {e}"
+                ) from e
+
+    class _XGBWrapped:
+        def __init__(self, booster_obj: "xgb.Booster"):
+            self._booster = booster_obj
+
+        def get_booster(self):
+            return self._booster
+
+        def predict(self, X):
+            # X é um DataFrame já reordenado pelo pipeline para bater com feature_names
+            import xgboost as xgb
+            dtest = xgb.DMatrix(X)
+            return self._booster.predict(dtest)
+
+    _model = _XGBWrapped(booster)
     return _model
 
 
@@ -74,10 +118,7 @@ app = Flask(__name__)
 # rota raiz
 @app.get("/")
 def root():
-    return {
-        "status": "running",
-        "message": "API Rossmann no ar 🚀"
-    }, 200
+    return {"status": "running", "message": "API Rossmann no ar 🚀"}, 200
 
 
 # rota de ping
@@ -86,37 +127,56 @@ def ping():
     return {"ping": "pong"}, 200
 
 
-# ===== 1b) /health com modo "deep" usando o cache do get_model() =====
+# ===== /health com modo "leve" e opção deep=1 =====
 @app.get("/health")
 def health():
+    """
+    Sem deep (padrão): não carrega o modelo em RAM (checagem leve de existência).
+    Com deep=1: carrega o modelo via get_model() e reporta sucesso/falha.
+    """
     try:
         deep = request.args.get("deep") == "1"
         app.logger.info(f"/health called deep={deep}")
 
         exists = MODEL_PATH.exists()
-        load_ok = None
-        err = None
         body = {
             "status": "ok",
             "model_path": str(MODEL_PATH),
             "model_exists": exists,
             "model_load_ok": None,
-            "model_error": None
+            "model_error": None,
         }
 
         if deep and exists:
-            # Checagem LEVE: sem carregar o modelo na RAM (evita OOM/queda do worker)
-            import hashlib
-            size = MODEL_PATH.stat().st_size
-            h = hashlib.sha256()
-            with open(MODEL_PATH, "rb") as f:
-                for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                    h.update(chunk)
-            body.update({
-                "model_size_bytes": size,
-                "model_sha256": h.hexdigest(),
-                "note": "light check: file present and readable; not loading into memory"
-            })
+            try:
+                m = get_model()
+                booster = m.get_booster()
+                # infos extras úteis
+                body.update(
+                    {
+                        "model_load_ok": True,
+                        "feature_count": len(getattr(booster, "feature_names", []) or []),
+                        "note": "deep check: booster carregado em memória",
+                    }
+                )
+            except Exception as e:
+                body.update({"model_load_ok": False, "model_error": str(e)})
+
+        # checagem leve sempre pode incluir tamanho/hash do arquivo
+        if exists:
+            try:
+                import hashlib
+
+                size = MODEL_PATH.stat().st_size
+                h = hashlib.sha256()
+                with open(MODEL_PATH, "rb") as f:
+                    for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                        h.update(chunk)
+                body.update(
+                    {"model_size_bytes": size, "model_sha256": h.hexdigest()}
+                )
+            except Exception:
+                pass
 
         return Response(json.dumps(body, ensure_ascii=False), 200, mimetype="application/json")
     except Exception as e:
@@ -125,13 +185,13 @@ def health():
         return Response(json.dumps(body, ensure_ascii=False), 500, mimetype="application/json")
 
 
-
-# ===== 1c) /rossmann/predict com logs de marcos + JSON tolerante =====
+# ===== /rossmann/predict com logs + JSON tolerante =====
 @app.post("/rossmann/predict")
 def rossmann_predict():
     try:
         app.logger.info("predict:start")
         import pandas as pd
+        import numpy as np
 
         # Tolerar ausência/erro de Content-Type usando force=True
         payload = request.get_json(silent=True, force=True)
@@ -143,38 +203,45 @@ def rossmann_predict():
         if isinstance(payload, dict):
             df_in = pd.DataFrame(payload, index=[0])
         elif isinstance(payload, list) and payload:
-            # DataFrame direto da lista de dicts
             df_in = pd.DataFrame(payload)
         else:
             app.logger.info("predict:payload_empty_list")
             return Response("[]", status=200, mimetype="application/json")
 
-        app.logger.info("predict:payload_ok rows=%d cols=%d", len(df_in), len(df_in.columns))
+        app.logger.info(
+            "predict:payload_ok rows=%d cols=%d", len(df_in), len(df_in.columns)
+        )
 
         # Pipeline
         pipeline = Rossmann()
         df1 = pipeline.data_cleaning(df_in.copy())
-        app.logger.info("predict:after_cleaning rows=%d cols=%d", len(df1), len(df1.columns))
+        app.logger.info(
+            "predict:after_cleaning rows=%d cols=%d", len(df1), len(df1.columns)
+        )
         df2 = pipeline.feature_engineering(df1)
-        app.logger.info("predict:after_fe rows=%d cols=%d", len(df2), len(df2.columns))
-        # ...
+        app.logger.info(
+            "predict:after_fe rows=%d cols=%d", len(df2), len(df2.columns)
+        )
         df3 = pipeline.data_preparation(df2)
-        app.logger.info("predict:after_prep rows=%d cols=%d", len(df3), len(df3.columns))
+        app.logger.info(
+            "predict:after_prep rows=%d cols=%d", len(df3), len(df3.columns)
+        )
 
-        # ===== DEBUG: permitir dry-run sem carregar o modelo =====
+        # ===== Modo dry-run (debug) para não carregar modelo =====
         if os.getenv("PREDICT_DRY_RUN", "0") == "1":
             preview = df3.head(3).to_dict(orient="records")
             body = {
                 "mode": "dry-run",
                 "prepared_shape": [int(len(df3)), int(len(df3.columns))],
                 "prepared_columns": list(df3.columns),
-                "prepared_preview": preview
+                "prepared_preview": preview,
             }
-            return Response(json.dumps(body, ensure_ascii=False), status=200, mimetype="application/json")
-        # ===== FIM DEBUG =====
+            return Response(
+                json.dumps(body, ensure_ascii=False), status=200, mimetype="application/json"
+            )
 
-        model = get_model()
-        
+        # ===== Predição real =====
+        model = get_model()  # carrega booster UBJ
         app.logger.info("predict:model_loaded")
 
         df_response = pipeline.get_prediction(model, df_in, df3)
@@ -190,6 +257,7 @@ def rossmann_predict():
 
     except Exception as e:
         import traceback
+
         app.logger.exception("predict:error")
         body = {"error": str(e), "type": e.__class__.__name__}
         # Opcional: exporte DEBUG_ERRORS=1 no Render para receber traceback no JSON
