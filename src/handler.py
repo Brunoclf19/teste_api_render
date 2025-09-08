@@ -235,10 +235,10 @@ def rossmann_predict():
         body = {"error": str(e), "type": e.__class__.__name__}
         if os.getenv("DEBUG_ERRORS", "0") == "1":
             body["trace"] = traceback.format_exc()
-        return Response(json.dumps(body, ensure_ascii=False), status=500, mimetype="application/json")
+        return Response(json.dumps(body, ensure_ascii=False), 500, mimetype="application/json")
 
 
-# ===== Forecast próximas semanas por loja =====
+# ===== Forecast próximas semanas por loja (corrigido para alinhar tamanhos) =====
 from datetime import date as _date, timedelta as _td
 
 @app.get("/rossmann/forecast/<int:store_id>")
@@ -259,15 +259,15 @@ def forecast_store(store_id: int):
         start_str = request.args.get("start")
         start = pd.to_datetime(start_str).date() if start_str else (_date.today() + _td(days=1))
 
-        # gera datas futuras (weeks*7)
+        # 1) gera datas futuras (weeks*7)
         dates = [start + _td(days=i) for i in range(weeks * 7)]
 
-        # regra simples: domingo fechado; demais dias abertos; sem feriado/escola; sem promo
-        rows = []
+        # 2) linhas "originais" para TODO o calendário (domingos incluídos)
+        rows_all = []
         for d in dates:
             dow = d.isoweekday()  # 1=seg ... 7=dom
             open_ = 0 if dow == 7 else 1
-            rows.append({
+            rows_all.append({
                 # nomes originais, iguais aos CSVs, porque seu pipeline renomeia
                 "Store": store_id,
                 "DayOfWeek": dow,
@@ -287,44 +287,54 @@ def forecast_store(store_id: int):
                 "Promo2SinceYear": None,
                 "PromoInterval": ""
             })
+        df_all = pd.DataFrame(rows_all)
+        df_all["Date"] = pd.to_datetime(df_all["Date"])
 
-        df_in = pd.DataFrame(rows)
-
-        # pipeline + modelo
+        # 3) rodar o pipeline APENAS nos dias abertos (para bater tamanho com predições)
+        df_in_open = df_all[df_all["Open"] != 0].copy()
         pipeline = Rossmann()
-        df1 = pipeline.data_cleaning(df_in.copy())
+        df1 = pipeline.data_cleaning(df_in_open.copy())
         df2 = pipeline.feature_engineering(df1)
         df3 = pipeline.data_preparation(df2)
         model = get_model()
-        json_resp = pipeline.get_prediction(model, df_in, df3)  # string JSON
+        json_resp = pipeline.get_prediction(model, df_in_open, df3)  # string JSON com N linhas (apenas abertas)
 
-        # pós-processamento: diário + semanal
-        df_out = pd.read_json(json_resp)
-        df_out["Date"] = pd.to_datetime(df_out["Date"])
-        iso = df_out["Date"].dt.isocalendar()
-        df_out["iso_year"] = iso.year.astype(int)
-        df_out["iso_week"] = iso.week.astype(int)
+        # 4) converter predições dos dias abertos e recompor com todos os dias (domingos = 0)
+        df_pred_open = pd.read_json(json_resp)
+        df_pred_open["Date"] = pd.to_datetime(df_pred_open["Date"])
 
+        # junta por Date; valores ausentes (domingos) -> 0
+        df_daily = df_all.merge(
+            df_pred_open[["Date", "predictions"]],
+            on="Date",
+            how="left",
+            suffixes=("", "_pred")
+        )
+        df_daily["predictions"] = df_daily["predictions"].fillna(0.0)
+
+        # 5) agregado semanal ISO (segunda a domingo)
+        iso = df_daily["Date"].dt.isocalendar()
         weekly = (
-            df_out.groupby(["iso_year", "iso_week"], as_index=False)["predictions"].sum()
-                .rename(columns={"iso_year": "year", "iso_week": "week", "predictions": "pred_week"})
+            df_daily.assign(iso_year=iso.year.astype(int), iso_week=iso.week.astype(int))
+                    .groupby(["iso_year", "iso_week"], as_index=False)["predictions"]
+                    .sum()
+                    .rename(columns={"iso_year": "year", "iso_week": "week", "predictions": "pred_week"})
         )
 
-        # início/fim da semana ISO (segunda a domingo)
         def _wk_bounds(y, w):
             start_wk = pd.to_datetime(f"{int(y)}-W{int(w):02d}-1").date()
             return start_wk, start_wk + _td(days=6)
 
-        weekly["week_start"], weekly["week_end"] = zip(*weekly.apply(
-            lambda r: _wk_bounds(r["year"], r["week"]), axis=1
-        ))
+        weekly["week_start"], weekly["week_end"] = zip(
+            *weekly.apply(lambda r: _wk_bounds(r["year"], r["week"]), axis=1)
+        )
 
         body = {
             "store": store_id,
             "weeks": weeks,
             "start": start.isoformat(),
             "assumptions": {"open_sunday": False, "promo_default": 0, "state_holiday": "0", "school_holiday": 0},
-            "daily": df_out[["Date", "predictions"]]
+            "daily": df_daily[["Date", "predictions"]]
                         .assign(Date=lambda d: d["Date"].dt.date.astype(str))
                         .to_dict(orient="records"),
             "weekly": weekly[["year","week","week_start","week_end","pred_week"]]
