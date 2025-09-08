@@ -11,10 +11,9 @@ os.environ.setdefault("BLIS_NUM_THREADS", "1")
 
 import sys
 import json
-import pickle  # mantido só por compat; não é usado no load do booster
 from pathlib import Path
 from flask import Flask, request, Response
-from flask_cors import CORS  # <— CORS
+from flask_cors import CORS  # CORS
 
 # ========= Descobrir raiz do repo =========
 def find_repo_root(start: Path) -> Path:
@@ -113,8 +112,7 @@ def get_model():
 # ========= App =========
 app = Flask(__name__)
 
-# ===== CORS (parte 2): habilitar chamadas do navegador =====
-# Para liberar tudo em /rossmann/* (simples). Depois você pode restringir usando CORS_ORIGINS.
+# ===== CORS: habilitar chamadas do navegador (ajuste origins se quiser restringir) =====
 CORS(app, resources={r"/rossmann/*": {"origins": "*"}})
 
 # rota raiz
@@ -216,8 +214,8 @@ def rossmann_predict():
         df3 = pipeline.data_preparation(df2)
         app.logger.info("predict:after_prep rows=%d cols=%d", len(df3), len(df3.columns))
 
-        # ===== Predição real =====
-        model = get_model()  # carrega booster UBJ
+        # Predição
+        model = get_model()
         app.logger.info("predict:model_loaded")
 
         df_response = pipeline.get_prediction(model, df_in, df3)
@@ -238,6 +236,111 @@ def rossmann_predict():
         if os.getenv("DEBUG_ERRORS", "0") == "1":
             body["trace"] = traceback.format_exc()
         return Response(json.dumps(body, ensure_ascii=False), status=500, mimetype="application/json")
+
+
+# ===== Forecast próximas semanas por loja =====
+from datetime import date as _date, timedelta as _td
+
+@app.get("/rossmann/forecast/<int:store_id>")
+def forecast_store(store_id: int):
+    """
+    Gera linhas futuras (diárias) para a loja e retorna:
+      - daily: previsões diárias do modelo
+      - weekly: agregação por semana ISO (ano/semana + início/fim)
+    Parâmetros:
+      weeks (int, default 6)
+      start (YYYY-MM-DD, default amanhã)
+    """
+    try:
+        import pandas as pd
+
+        # parâmetros: ?weeks=6&start=YYYY-MM-DD
+        weeks = int(request.args.get("weeks", "6"))
+        start_str = request.args.get("start")
+        start = pd.to_datetime(start_str).date() if start_str else (_date.today() + _td(days=1))
+
+        # gera datas futuras (weeks*7)
+        dates = [start + _td(days=i) for i in range(weeks * 7)]
+
+        # regra simples: domingo fechado; demais dias abertos; sem feriado/escola; sem promo
+        rows = []
+        for d in dates:
+            dow = d.isoweekday()  # 1=seg ... 7=dom
+            open_ = 0 if dow == 7 else 1
+            rows.append({
+                # nomes originais, iguais aos CSVs, porque seu pipeline renomeia
+                "Store": store_id,
+                "DayOfWeek": dow,
+                "Date": d.isoformat(),
+                "Open": open_,
+                "Promo": 0,
+                "StateHoliday": "0",
+                "SchoolHoliday": 0,
+                # metadados padrão (ajuste se quiser por loja)
+                "StoreType": "a",
+                "Assortment": "a",
+                "CompetitionDistance": None,
+                "CompetitionOpenSinceMonth": None,
+                "CompetitionOpenSinceYear": None,
+                "Promo2": 0,
+                "Promo2SinceWeek": None,
+                "Promo2SinceYear": None,
+                "PromoInterval": ""
+            })
+
+        df_in = pd.DataFrame(rows)
+
+        # pipeline + modelo
+        pipeline = Rossmann()
+        df1 = pipeline.data_cleaning(df_in.copy())
+        df2 = pipeline.feature_engineering(df1)
+        df3 = pipeline.data_preparation(df2)
+        model = get_model()
+        json_resp = pipeline.get_prediction(model, df_in, df3)  # string JSON
+
+        # pós-processamento: diário + semanal
+        df_out = pd.read_json(json_resp)
+        df_out["Date"] = pd.to_datetime(df_out["Date"])
+        iso = df_out["Date"].dt.isocalendar()
+        df_out["iso_year"] = iso.year.astype(int)
+        df_out["iso_week"] = iso.week.astype(int)
+
+        weekly = (
+            df_out.groupby(["iso_year", "iso_week"], as_index=False)["predictions"].sum()
+                .rename(columns={"iso_year": "year", "iso_week": "week", "predictions": "pred_week"})
+        )
+
+        # início/fim da semana ISO (segunda a domingo)
+        def _wk_bounds(y, w):
+            start_wk = pd.to_datetime(f"{int(y)}-W{int(w):02d}-1").date()
+            return start_wk, start_wk + _td(days=6)
+
+        weekly["week_start"], weekly["week_end"] = zip(*weekly.apply(
+            lambda r: _wk_bounds(r["year"], r["week"]), axis=1
+        ))
+
+        body = {
+            "store": store_id,
+            "weeks": weeks,
+            "start": start.isoformat(),
+            "assumptions": {"open_sunday": False, "promo_default": 0, "state_holiday": "0", "school_holiday": 0},
+            "daily": df_out[["Date", "predictions"]]
+                        .assign(Date=lambda d: d["Date"].dt.date.astype(str))
+                        .to_dict(orient="records"),
+            "weekly": weekly[["year","week","week_start","week_end","pred_week"]]
+                        .assign(week_start=lambda d: d["week_start"].astype(str),
+                                week_end=lambda d: d["week_end"].astype(str))
+                        .to_dict(orient="records"),
+        }
+        return Response(json.dumps(body, ensure_ascii=False), 200, mimetype="application/json")
+
+    except Exception as e:
+        import traceback
+        app.logger.exception("forecast:error")
+        payload = {"error": str(e), "type": e.__class__.__name__}
+        if os.getenv("DEBUG_ERRORS","0") == "1":
+            payload["trace"] = traceback.format_exc()
+        return Response(json.dumps(payload, ensure_ascii=False), 500, mimetype="application/json")
 
 
 if __name__ == "__main__":
